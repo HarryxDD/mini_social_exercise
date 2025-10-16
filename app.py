@@ -7,6 +7,9 @@ import sqlite3
 import hashlib
 import re
 from datetime import datetime
+import math
+from nltk.corpus import stopwords
+import nltk
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -26,6 +29,13 @@ MODERATION_CONFIG = json.loads(decrypted_data)
 TIER1_WORDS = MODERATION_CONFIG['categories']['tier1_severe_violations']['words']
 TIER2_PHRASES = MODERATION_CONFIG['categories']['tier2_spam_scams']['phrases']
 TIER3_WORDS = MODERATION_CONFIG['categories']['tier3_mild_profanity']['words']
+
+try:
+    STOP_WORDS = set(stopwords.words('english'))
+except LookupError:
+    # Download stopwords data if not already present
+    nltk.download('stopwords', quiet=True)
+    STOP_WORDS = set(stopwords.words('english'))
 
 def get_db():
     """
@@ -888,11 +898,177 @@ def recommend(user_id, filter_following):
     - https://www.nvidia.com/en-us/glossary/recommendation-system/
     - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
+
+    After reading through the materials, I decided to implement a hybrid recommendation system that combines content-based filtering with collaborative filtering, explicitly weighting different types of user feedback, and improving cold start handling.
+
+    Besides, I also implemented several NLP techniques:
+    - Stop word filtering
+    - TF weighting
+    - User similarity via collaborative filtering
     """
-
-    recommended_posts = {} 
-
-    return recommended_posts;
+    
+    # Cold Start Strategy
+    if not user_id:
+        popular_posts = query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            ORDER BY p.created_at DESC
+            LIMIT 5
+        ''')
+        return popular_posts if popular_posts else []
+    
+    # Check if user has interactions
+    user_reactions = query_db('''
+        SELECT p.content, r.reaction_type
+        FROM reactions r
+        JOIN posts p ON r.post_id = p.id
+        WHERE r.user_id = ?
+    ''', (user_id,))
+    
+    if not user_reactions:
+        if filter_following:
+            qr = query_db('''
+                SELECT DISTINCT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                JOIN follows f ON p.user_id = f.followed_id
+                WHERE f.follower_id = ? AND p.user_id != ?
+                ORDER BY p.created_at DESC
+                LIMIT 5
+            ''', (user_id, user_id))
+        else:
+            qr = query_db('''
+                SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                WHERE p.user_id != ?
+                ORDER BY p.created_at DESC
+                LIMIT 5
+            ''', (user_id,))
+        return qr if qr else []
+    
+    REACTION_WEIGHTS = {
+        'love': 2.0, 'like': 1.5, 'wow': 1.2,
+        'laugh': 1.0, 'sad': 0.3, 'angry': 0.1
+    }
+    
+    interest_keywords = {}
+    for reaction in user_reactions:
+        weight = REACTION_WEIGHTS.get(reaction['reaction_type'], 0.5)
+        words = reaction['content'].lower().split()
+        
+        for word in words:
+            clean_word = ''.join(c for c in word if c.isalnum() or c == '#')
+            # Stop word filtering
+            if len(clean_word) >= 3 and clean_word.lower() not in STOP_WORDS:
+                if clean_word.startswith('#'):
+                    weight *= 2  # Hashtags are strong signals
+                interest_keywords[clean_word] = interest_keywords.get(clean_word, 0) + weight
+    
+    similar_users = query_db('''
+        SELECT r2.user_id, COUNT(*) as common_likes
+        FROM reactions r1
+        JOIN reactions r2 ON r1.post_id = r2.post_id
+        WHERE r1.user_id = ? AND r2.user_id != ?
+        GROUP BY r2.user_id
+        HAVING common_likes >= 2
+        ORDER BY common_likes DESC
+        LIMIT 5
+    ''', (user_id, user_id))
+    
+    similar_user_ids = [u['user_id'] for u in similar_users] if similar_users else []
+    
+    # Get posts user has already reacted to (exclude them from recommendations)
+    reacted_post_ids = query_db('''
+        SELECT post_id FROM reactions WHERE user_id = ?
+    ''', (user_id,))
+    reacted_ids = [str(row['post_id']) for row in reacted_post_ids] if reacted_post_ids else []
+    
+    if filter_following:
+        if reacted_ids:
+            candidates = query_db('''
+                SELECT DISTINCT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                JOIN follows f ON p.user_id = f.followed_id
+                WHERE f.follower_id = ? AND p.user_id != ?
+                  AND p.id NOT IN ({})
+                ORDER BY p.created_at DESC
+                LIMIT 100
+            '''.format(','.join('?' * len(reacted_ids))), (user_id, user_id) + tuple(reacted_ids))
+        else:
+            candidates = query_db('''
+                SELECT DISTINCT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                JOIN follows f ON p.user_id = f.followed_id
+                WHERE f.follower_id = ? AND p.user_id != ?
+                ORDER BY p.created_at DESC
+                LIMIT 100
+            ''', (user_id, user_id))
+    else:
+        if reacted_ids:
+            candidates = query_db('''
+                SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                WHERE p.user_id != ?
+                  AND p.id NOT IN ({})
+                ORDER BY p.created_at DESC
+                LIMIT 200
+            '''.format(','.join('?' * len(reacted_ids))), (user_id,) + tuple(reacted_ids))
+        else:
+            candidates = query_db('''
+                SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                WHERE p.user_id != ?
+                ORDER BY p.created_at DESC
+                LIMIT 200
+            ''', (user_id, user_id))
+    
+    if not candidates:
+        return []
+    
+    scored_posts = []
+    
+    for post in candidates:
+        score = 0
+        
+        # Content-based
+        post_words = post['content'].lower().split()
+        for word in post_words:
+            clean_word = ''.join(c for c in word if c.isalnum() or c == '#')
+            if clean_word in interest_keywords:
+                score += interest_keywords[clean_word]
+        
+        # Collaborative
+        if similar_user_ids:
+            for similar_user in similar_user_ids:
+                liked_by_similar = query_db('''
+                    SELECT 1 FROM reactions 
+                    WHERE post_id = ? AND user_id = ?
+                    LIMIT 1
+                ''', (post['id'], similar_user), one=True)
+                if liked_by_similar:
+                    score += 2
+        
+        post_date = post['created_at'] if isinstance(post['created_at'], datetime) else datetime.strptime(post['created_at'], '%Y-%m-%d %H:%M:%S')
+        days_old = (datetime.utcnow() - post_date).days
+        if days_old < 7:
+            score += 1
+        elif days_old < 30:
+            score += 0.5
+        
+        scored_posts.append((post, score))
+    
+    scored_posts.sort(key=lambda x: x[1], reverse=True)
+    top_posts = [post for post, score in scored_posts[:5]]
+    
+    top_posts.sort(key=lambda x: x['created_at'], reverse=True)
+    
+    return top_posts
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -909,11 +1085,80 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
     
-    score = 0
-
-    return score;
-
+    user = query_db('SELECT profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user:
+        return 0.0
     
+    # Step 1
+    profile_text = user['profile'] if user['profile'] else ''
+    _, profile_score = moderate_content(profile_text)
+    
+    # Step 2
+    posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    if posts and len(posts) > 0:
+        post_scores = []
+        for post in posts:
+            _, post_score = moderate_content(post['content'])
+            post_scores.append(post_score)
+        average_post_score = sum(post_scores) / len(post_scores)
+    else:
+        average_post_score = 0.0
+    
+    # Step 3
+    comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    if comments and len(comments) > 0:
+        comment_scores = []
+        for comment in comments:
+            _, comment_score = moderate_content(comment['content'])
+            comment_scores.append(comment_score)
+        average_comment_score = sum(comment_scores) / len(comment_scores)
+    else:
+        average_comment_score = 0.0
+    
+    # Step 4
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+    
+    # Step 5
+    user_created_at = user['created_at']
+    account_age_days = (datetime.utcnow() - user_created_at).days
+    
+    if account_age_days < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+    
+    """
+    Additional Risk Measure
+    This detects automated spam bots that post at unnaturally high frequencies.
+    I decided to implement this based on research into bot behavior patterns.
+    There are some reason that this might affect negatively to the platform:
+    - Bots can post clean content that evades keyword filters
+    - Make the platform less appealing to real users
+    - Bots can flood the platform with spam even if content seems clean 
+    """
+    
+    suspicious_activity_score = 0.0
+    
+    if posts and account_age_days > 0:
+        posts_per_day = len(posts) / max(account_age_days, 1)
+        
+        # Normal users rarely post more than 10 times per day consistently
+        if posts_per_day > 10:
+            suspicious_activity_score += 0.5
+        
+        # Accounts posting 20+ times per day are almost certainly automated bots
+        if posts_per_day > 20:
+            suspicious_activity_score += 0.5
+    
+    user_risk_score += suspicious_activity_score
+    
+    # Step 6
+    final_score = min(5.0, user_risk_score)
+    
+    return final_score
+
 # Task 3.3
 def moderate_content(content):
     """
@@ -932,8 +1177,121 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
+    # Handle empty or invalid content
+    if not content or not isinstance(content, str):
+        return content, 0.0
+    
     moderated_content = content
-    score = 0
+    score = 0.0
+    
+    # Rule 1.1.1
+    """
+    A case-insensitive, whole-word search is performed against the Tier 1 Word List. If a match is found, the function immediately returns the string [content removed due to severe violation] and a fixed Content Score of 5.0.
+    """
+    for word in TIER1_WORDS:
+        pattern = r'\b' + re.escape(word) + r'\b'
+        if re.search(pattern, content, re.IGNORECASE):
+            return "[content removed due to severe violation]", 5.0
+    
+    # Rule 1.1.2
+    """
+    If no Tier 1 match is found, a case-insensitive, whole-phrase search is performed against the Tier 2 Phrase List. If a match is found, the function immediately returns the string [content removed due to spam/scam policy] and a fixed Content Score of 5.0.
+    """
+    for phrase in TIER2_PHRASES:
+        # Use word boundaries for whole phrase matching
+        pattern = r'\b' + re.escape(phrase) + r'\b'
+        if re.search(pattern, content, re.IGNORECASE):
+            return "[content removed due to spam/scam policy]", 5.0
+    
+    # Rule 1.2.1
+    """
+    Each case-insensitive, whole-word match from the Tier 3 Word List is replaced with asterisks (*) equal to its length. The Content Score is incremented by +2.0 for each match.
+    """
+    for word in TIER3_WORDS:
+        pattern = r'\b' + re.escape(word) + r'\b'
+        matches = re.findall(pattern, moderated_content, re.IGNORECASE)
+        if matches:
+            score += len(matches) * 2.0
+            def replace_with_asterisks(match):
+                return '*' * len(match.group(0))
+            moderated_content = re.sub(pattern, replace_with_asterisks, moderated_content, flags=re.IGNORECASE)
+    
+    # Rule 1.2.2
+    """
+    Each detected URL is replaced with [link removed]. The Content Score is incremented by +2.0 for each match.
+    
+    After detecting some odd URLs, I decided to implement some enhanced URL detection that checks for:
+    - Full URLs with and without http(s) protocol
+    - Obfuscated URLs: example[.]com, domain[dot]org (spammer technique to bypass filters)
+    - Common TLDs: .com, .org, .net, .edu, .gov, .io, .co.uk, .co.jp, etc.
+    - Excludes URLs inside square brackets [example.com] to avoid false positives
+    """
+    
+    # Here I de-obfuscate URLs by replacing [.] and [dot] with actual dots
+    # I temporarily convert these to domain.com so our pattern can detect them
+    deobfuscated_content = moderated_content
+    deobfuscated_content = re.sub(r'\[\.\]', '.', deobfuscated_content)
+    deobfuscated_content = re.sub(r'\[dot\]', '.', deobfuscated_content, flags=re.IGNORECASE)
+
+    # Regex pattern explaination:
+    # https?://[^\s\[\]]+  -> Matches full URLs starting with http:// or https://
+    # www\.[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9] -> Matches URLs starting with www.
+    # \b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-z]{2,}(?:\.[a-z]{2,})? -> Matches domain.abc or domain.abc.abc
+    url_pattern = r'(?<![@\[])(?:https?://[^\s\[\]]+|www\.[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9](?:/[^\s\[\]]*)?|\b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-z]{2,}(?:\.[a-z]{2,})?(?:/[^\s\[\]]*)?)(?!\])'
+    
+    urls = re.findall(url_pattern, deobfuscated_content, re.IGNORECASE)
+    if urls:
+        url_count = len(urls)
+        score += url_count * 2.0
+        moderated_content = re.sub(url_pattern, '[link removed]', deobfuscated_content, flags=re.IGNORECASE)
+    
+    # Rule 1.2.3
+    """
+    If content has >15 alphabetic characters and >70% are uppercase, the Content Score is incremented by a fixed value of +0.5. The content is not modified.
+    """
+    alphabetic_chars = [c for c in moderated_content if c.isalpha()]
+    if len(alphabetic_chars) > 15:
+        uppercase_count = sum(1 for c in alphabetic_chars if c.isupper())
+        uppercase_ratio = uppercase_count / len(alphabetic_chars)
+        if uppercase_ratio > 0.7:
+            score += 0.5
+    
+    # Additional measure: Giveaway/Contest Spam Detection
+    """
+    After investigating the dataset, I found that giveaway and contest spam is a probable issue on this platform, because it can lead to harmful outcomes for users. To name a few: leading to phising attempts, create false expectations and disappointment, etc.
+    
+    Real examples from the platform that currently score 0.0 but are clearly spam:
+    - "FLASH GIVEAWAY? Click the link in our bio to claim your PS5! Only 100 units left!"
+    - "We're giving away $1000 to 5 lucky people! Like, share, and comment 'WIN' to enter!"
+    
+    Penalty: +2.0 (severe spam that harms user trust and security)
+    """
+    
+    # Define giveaway spam patterns with their regex
+    giveaway_patterns = [
+        r'\bgiveaway\b',
+        r'\bgiving away\b',
+        r'\bwin free\b',   
+        r'\bclaim your\b', 
+        r'\bclick\s+(the\s+)?link\b',
+        r'\b(dm|message)\s+(us|me)\b',
+        r'\bfollow\s+and\b',          
+        r'\benter\s+to\s+win\b',      
+        r'\bonly\s+\d+\s+(left|units)\b',
+        r'\bflash\s+giveaway\b',         
+        r'\bcontest\s+alert\b',          
+        r'\blucky\s+(winner|people)\b',  
+    ]
+    
+    giveaway_matches = 0
+    content_lower = content.lower()
+    
+    for pattern in giveaway_patterns:
+        if re.search(pattern, content_lower):
+            giveaway_matches += 1
+    
+    if giveaway_matches >= 2:
+        score += 2.0
     
     return moderated_content, score
 
