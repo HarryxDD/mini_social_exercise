@@ -905,20 +905,29 @@ def recommend(user_id, filter_following):
     - Stop word filtering
     - TF weighting
     - User similarity via collaborative filtering
+
+    After tried to follow Users with DIY interests and react to their posts, the recommendation algorithm started to show more DIY-related posts in the recommend tab.
     """
     
     # Cold Start Strategy
+    """
+    If the user is not logged in, I simply return the 5 most recent posts by selecting from the posts table ordered by created_at DESC
+    """
     if not user_id:
-        popular_posts = query_db('''
+        recent_posts = query_db('''
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
             FROM posts p
             JOIN users u ON p.user_id = u.id
             ORDER BY p.created_at DESC
             LIMIT 5
         ''')
-        return popular_posts if popular_posts else []
+        return recent_posts if recent_posts else []
     
     # Check if user has interactions
+    """
+    This query checks if the user has any reactions recorded in the reactions table
+    The WHERE r.user_id = ? clause get the user_id that are passed into and filters reactions to only those made by the current user
+    """
     user_reactions = query_db('''
         SELECT p.content, r.reaction_type
         FROM reactions r
@@ -928,6 +937,9 @@ def recommend(user_id, filter_following):
     
     if not user_reactions:
         if filter_following:
+            """
+            This query fetch the most recent posts from users that the current user follows by joining the posts, users, and follows tables. The WHERE f.follower_id = ? clause filters the posts to only those made by users that the current user follows
+            """
             qr = query_db('''
                 SELECT DISTINCT p.id, p.content, p.created_at, u.username, u.id as user_id
                 FROM posts p
@@ -938,6 +950,9 @@ def recommend(user_id, filter_following):
                 LIMIT 5
             ''', (user_id, user_id))
         else:
+            """
+            This query fetches the 5 most recent posts from all users except the current user (WHERE p.user_id != ?) by joining the posts and users tables
+            """
             qr = query_db('''
                 SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
                 FROM posts p
@@ -948,11 +963,17 @@ def recommend(user_id, filter_following):
             ''', (user_id,))
         return qr if qr else []
     
+    """
+    I decided to assign different weights to different reaction types to reflect their significance in indicating user interest
+    """
     REACTION_WEIGHTS = {
         'love': 2.0, 'like': 1.5, 'wow': 1.2,
         'laugh': 1.0, 'sad': 0.3, 'angry': 0.1
     }
     
+    """
+    To find interest keywords, I analyze the content of posts the user has reacted to, applying weights based on reaction types. I also implement stop word filtering to focus on meaningful keywords and give more weight to hashtags
+    """
     interest_keywords = {}
     for reaction in user_reactions:
         weight = REACTION_WEIGHTS.get(reaction['reaction_type'], 0.5)
@@ -966,6 +987,9 @@ def recommend(user_id, filter_following):
                     weight *= 2  # Hashtags are strong signals
                 interest_keywords[clean_word] = interest_keywords.get(clean_word, 0) + weight
     
+    """
+    This query identifies users with same interest by finding common reactions on the same posts. It count the number of common likes between the current user and other users, filtering for those with at least 2 common likes by joining the reactions table on itself and than grouping by the other user's ID. 5 similar users will be selected based on the highest count of common likes
+    """
     similar_users = query_db('''
         SELECT r2.user_id, COUNT(*) as common_likes
         FROM reactions r1
@@ -979,12 +1003,25 @@ def recommend(user_id, filter_following):
     
     similar_user_ids = [u['user_id'] for u in similar_users] if similar_users else []
     
-    # Get posts user has already reacted to (exclude them from recommendations)
+    # Exclude those from recommendations)
     reacted_post_ids = query_db('''
         SELECT post_id FROM reactions WHERE user_id = ?
     ''', (user_id,))
+
+    # This is the react ids of the posts the user has already reacted to
     reacted_ids = [str(row['post_id']) for row in reacted_post_ids] if reacted_post_ids else []
     
+    """
+    I fetch candidate posts based on whether to filter by followed users or not, and exclude posts the user has already reacted to. The queries join the posts and users tables, and order the results by creation date to prioritize recent content
+    
+    The flow for this section is as follows:
+    - If filter_following is True:
+        - If reacted_ids is not empty, fetch posts from followed users excluding reacted posts
+        - Else, fetch posts from followed users
+    - Else:
+        - If reacted_ids is not empty, fetch posts from all users excluding reacted posts
+        - Else, fetch posts from all users
+    """
     if filter_following:
         if reacted_ids:
             candidates = query_db('''
@@ -1036,14 +1073,20 @@ def recommend(user_id, filter_following):
     for post in candidates:
         score = 0
         
-        # Content-based
+        """
+        Content-Based Filtering
+        I analyze the content of each candidate post for keywords that match the user's interests, increamenting the score based on the presence and weight of these keywords
+        """
         post_words = post['content'].lower().split()
         for word in post_words:
             clean_word = ''.join(c for c in word if c.isalnum() or c == '#')
             if clean_word in interest_keywords:
                 score += interest_keywords[clean_word]
         
-        # Collaborative
+        """
+        Collaborative Filtering
+        I check if any similar users have liked the candidate post. If so, I increase the score
+        """
         if similar_user_ids:
             for similar_user in similar_user_ids:
                 liked_by_similar = query_db('''
@@ -1054,6 +1097,9 @@ def recommend(user_id, filter_following):
                 if liked_by_similar:
                     score += 2
         
+        """
+        I also increase the score for more recent posts to prioritize fresh content
+        """
         post_date = post['created_at'] if isinstance(post['created_at'], datetime) else datetime.strptime(post['created_at'], '%Y-%m-%d %H:%M:%S')
         days_old = (datetime.utcnow() - post_date).days
         if days_old < 7:
@@ -1089,11 +1135,11 @@ def user_risk_analysis(user_id):
     if not user:
         return 0.0
     
-    # Step 1
+    # Step 1: I moderate the user's profile description and get the score from it
     profile_text = user['profile'] if user['profile'] else ''
     _, profile_score = moderate_content(profile_text)
     
-    # Step 2
+    # Step 2: I moderate all posts made by the user and calculate the average post score by iterating through each post, moderating its content, and collecting the scores to compute the average
     posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
     if posts and len(posts) > 0:
         post_scores = []
@@ -1104,7 +1150,7 @@ def user_risk_analysis(user_id):
     else:
         average_post_score = 0.0
     
-    # Step 3
+    # Step 3: I moderate all comments and get the average comment score just like posts
     comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
     if comments and len(comments) > 0:
         comment_scores = []
@@ -1115,10 +1161,10 @@ def user_risk_analysis(user_id):
     else:
         average_comment_score = 0.0
     
-    # Step 4
+    # Step 4: I calculate the content risk score using weighted contributions from profile, posts, and comments
     content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
     
-    # Step 5
+    # Step 5: I adjust the risk score based on account age
     user_created_at = user['created_at']
     account_age_days = (datetime.utcnow() - user_created_at).days
     
@@ -1141,6 +1187,9 @@ def user_risk_analysis(user_id):
     
     suspicious_activity_score = 0.0
     
+    """
+    First, I check the posting frequency by calculating the average number of posts per day since account creation
+    """
     if posts and account_age_days > 0:
         posts_per_day = len(posts) / max(account_age_days, 1)
         
@@ -1184,8 +1233,8 @@ def moderate_content(content):
     moderated_content = content
     score = 0.0
     
-    # Rule 1.1.1
     """
+    Rule 1.1.1
     A case-insensitive, whole-word search is performed against the Tier 1 Word List. If a match is found, the function immediately returns the string [content removed due to severe violation] and a fixed Content Score of 5.0.
     """
     for word in TIER1_WORDS:
@@ -1193,8 +1242,8 @@ def moderate_content(content):
         if re.search(pattern, content, re.IGNORECASE):
             return "[content removed due to severe violation]", 5.0
     
-    # Rule 1.1.2
     """
+    Rule 1.1.2
     If no Tier 1 match is found, a case-insensitive, whole-phrase search is performed against the Tier 2 Phrase List. If a match is found, the function immediately returns the string [content removed due to spam/scam policy] and a fixed Content Score of 5.0.
     """
     for phrase in TIER2_PHRASES:
@@ -1203,8 +1252,8 @@ def moderate_content(content):
         if re.search(pattern, content, re.IGNORECASE):
             return "[content removed due to spam/scam policy]", 5.0
     
-    # Rule 1.2.1
     """
+    Rule 1.2.1
     Each case-insensitive, whole-word match from the Tier 3 Word List is replaced with asterisks (*) equal to its length. The Content Score is incremented by +2.0 for each match.
     """
     for word in TIER3_WORDS:
@@ -1216,8 +1265,8 @@ def moderate_content(content):
                 return '*' * len(match.group(0))
             moderated_content = re.sub(pattern, replace_with_asterisks, moderated_content, flags=re.IGNORECASE)
     
-    # Rule 1.2.2
     """
+    Rule 1.2.2
     Each detected URL is replaced with [link removed]. The Content Score is incremented by +2.0 for each match.
     
     After detecting some odd URLs, I decided to implement some enhanced URL detection that checks for:
@@ -1225,18 +1274,21 @@ def moderate_content(content):
     - Obfuscated URLs: example[.]com, domain[dot]org (spammer technique to bypass filters)
     - Common TLDs: .com, .org, .net, .edu, .gov, .io, .co.uk, .co.jp, etc.
     - Excludes URLs inside square brackets [example.com] to avoid false positives
-    """
-    
+
+
     # Here I de-obfuscate URLs by replacing [.] and [dot] with actual dots
     # I temporarily convert these to domain.com so our pattern can detect them
+    """
     deobfuscated_content = moderated_content
     deobfuscated_content = re.sub(r'\[\.\]', '.', deobfuscated_content)
     deobfuscated_content = re.sub(r'\[dot\]', '.', deobfuscated_content, flags=re.IGNORECASE)
 
-    # Regex pattern explaination:
-    # https?://[^\s\[\]]+  -> Matches full URLs starting with http:// or https://
-    # www\.[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9] -> Matches URLs starting with www.
-    # \b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-z]{2,}(?:\.[a-z]{2,})? -> Matches domain.abc or domain.abc.abc
+    """
+    Regex pattern explaination:
+    https?://[^\s\[\]]+  -> Matches full URLs starting with http:// or https://
+    www\.[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9] -> Matches URLs starting with www.
+    \b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-z]{2,}(?:\.[a-z]{2,})? -> Matches domain.abc or domain.abc.abc
+    """
     url_pattern = r'(?<![@\[])(?:https?://[^\s\[\]]+|www\.[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9](?:/[^\s\[\]]*)?|\b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-z]{2,}(?:\.[a-z]{2,})?(?:/[^\s\[\]]*)?)(?!\])'
     
     urls = re.findall(url_pattern, deobfuscated_content, re.IGNORECASE)
@@ -1245,8 +1297,8 @@ def moderate_content(content):
         score += url_count * 2.0
         moderated_content = re.sub(url_pattern, '[link removed]', deobfuscated_content, flags=re.IGNORECASE)
     
-    # Rule 1.2.3
     """
+    Rule 1.2.3
     If content has >15 alphabetic characters and >70% are uppercase, the Content Score is incremented by a fixed value of +0.5. The content is not modified.
     """
     alphabetic_chars = [c for c in moderated_content if c.isalpha()]
@@ -1256,8 +1308,8 @@ def moderate_content(content):
         if uppercase_ratio > 0.7:
             score += 0.5
     
-    # Additional measure: Giveaway/Contest Spam Detection
     """
+    Additional measure: Giveaway/Contest Spam Detection
     After investigating the dataset, I found that giveaway and contest spam is a probable issue on this platform, because it can lead to harmful outcomes for users. To name a few: leading to phising attempts, create false expectations and disappointment, etc.
     
     Real examples from the platform that currently score 0.0 but are clearly spam:
@@ -1286,6 +1338,9 @@ def moderate_content(content):
     giveaway_matches = 0
     content_lower = content.lower()
     
+    """
+    I count the number of giveaway-related patterns matched in the content. If 2 or more patterns are found, I consider it as giveaway spam and increment the score by +2.0
+    """
     for pattern in giveaway_patterns:
         if re.search(pattern, content_lower):
             giveaway_matches += 1
