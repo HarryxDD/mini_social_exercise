@@ -959,7 +959,10 @@ def admin_report_action(report_id):
         flash('Report marked as reviewed.', 'success')
     elif action == 'delete_post':
         report = query_db('SELECT post_id FROM reports WHERE id = ?', (report_id,), one=True)
-        if report and report.get('post_id'):
+        # sqlite3.Row does not implement dict.get(). Access fields using
+        # mapping/indexing or convert to dict(). Check explicitly for None
+        # because post_id may be NULL for global/site reports.
+        if report and report['post_id'] is not None:
             post_id = report['post_id']
             # Delete post and related content
             db.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
