@@ -158,7 +158,10 @@
         <a href="/posts/{{ entry.post.id }}" class="btn btn-sm btn-light show-comments-btn">
           Show all comments
         </a>
-        <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addCommentModal-{{ entry.post.id }}">Add Comment</button>
+        <div>
+          <button class="btn btn-danger btn-sm me-2" data-bs-toggle="modal" data-bs-target="#reportModal-{{ entry.post.id }}">Report</button>
+          <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addCommentModal-{{ entry.post.id }}">Add Comment</button>
+        </div>
       </div>
     </div>
   </div>
@@ -178,6 +181,37 @@
               <textarea class="form-control" id="comment-content-{{ entry.post.id }}" name="content" rows="3" required></textarea>
             </div>
             <button type="submit" class="btn btn-primary">Submit Comment</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+  <div class="modal fade" id="reportModal-{{ entry.post.id }}" tabindex="-1" aria-labelledby="reportModalLabel-{{ entry.post.id }}" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="reportModalLabel-{{ entry.post.id }}">Report Post</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <form action="{{ url_for('report_post') }}" method="POST">
+            <input type="hidden" name="post_id" value="{{ entry.post.id }}">
+            <div class="mb-3">
+              <label for="reason-{{ entry.post.id }}" class="form-label">Reason</label>
+              <select class="form-select" id="reason-{{ entry.post.id }}" name="reason_type">
+                <option value="Spam">Spam</option>
+                <option value="Harassment">Harassment</option>
+                <option value="Hate speech">Hate speech</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+            <div class="mb-3">
+              <label for="details-{{ entry.post.id }}" class="form-label">Details (optional)</label>
+              <textarea class="form-control" id="details-{{ entry.post.id }}" name="reason" rows="3"></textarea>
+            </div>
+            <button type="submit" class="btn btn-danger">Submit Report</button>
           </form>
         </div>
       </div>

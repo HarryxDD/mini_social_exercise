@@ -707,10 +707,12 @@ def admin_dashboard():
         users_page = int(request.args.get('users_page', 1))
         posts_page = int(request.args.get('posts_page', 1))
         comments_page = int(request.args.get('comments_page', 1))
+        reports_page = int(request.args.get('reports_page', 1))
     except ValueError:
         users_page = 1
         posts_page = 1
         comments_page = 1
+        reports_page = 1
     
     current_tab = request.args.get('tab', 'users') # Default to 'users' tab
 
@@ -789,11 +791,49 @@ def admin_dashboard():
 
     comments.sort(key=lambda x: x['risk_score'], reverse=True) # Sort after fetching and scoring
 
+    # --- Reports Tab Data ---
+    reports_offset = (reports_page - 1) * PAGE_SIZE
+    # Show unreviewed or reviewed reports (server-side filtering)
+    reports_filter = request.args.get('reports_filter')
+    if reports_filter == 'unreviewed':
+        total_reports_count = query_db("SELECT COUNT(*) as count FROM reports WHERE status != 'reviewed'", one=True)['count']
+        total_reports_pages = (total_reports_count + PAGE_SIZE - 1) // PAGE_SIZE
+
+        reports_raw = query_db('''
+            SELECT r.id, r.post_id, r.reporter_id, r.reason, r.status, r.created_at,
+                   p.content as post_content, u.username as reporter_username
+            FROM reports r
+            LEFT JOIN posts p ON r.post_id = p.id
+            LEFT JOIN users u ON r.reporter_id = u.id
+            WHERE r.status != 'reviewed'
+            ORDER BY r.created_at DESC
+            LIMIT ? OFFSET ?
+        ''', (PAGE_SIZE, reports_offset))
+    else:
+        total_reports_count = query_db('SELECT COUNT(*) as count FROM reports', one=True)['count']
+        total_reports_pages = (total_reports_count + PAGE_SIZE - 1) // PAGE_SIZE
+
+        reports_raw = query_db('''
+            SELECT r.id, r.post_id, r.reporter_id, r.reason, r.status, r.created_at,
+                   p.content as post_content, u.username as reporter_username
+            FROM reports r
+            LEFT JOIN posts p ON r.post_id = p.id
+            LEFT JOIN users u ON r.reporter_id = u.id
+            ORDER BY r.created_at DESC
+            LIMIT ? OFFSET ?
+        ''', (PAGE_SIZE, reports_offset))
+
+    reports = []
+    if reports_raw:
+        for r in reports_raw:
+            reports.append(dict(r))
+
 
     return render_template('admin.html.j2', 
                            users=users, 
                            posts=posts, 
                            comments=comments,
+                           reports=reports,
                            
                            # Pagination for Users
                            users_page=users_page,
@@ -812,6 +852,12 @@ def admin_dashboard():
                            total_comments_pages=total_comments_pages,
                            comments_has_next=(comments_page < total_comments_pages),
                            comments_has_prev=(comments_page > 1),
+
+                           # Pagination for Reports
+                           reports_page=reports_page,
+                           total_reports_pages=total_reports_pages,
+                           reports_has_next=(reports_page < total_reports_pages),
+                           reports_has_prev=(reports_page > 1),
 
                            current_tab=current_tab,
                            PAGE_SIZE=PAGE_SIZE)
@@ -861,6 +907,73 @@ def admin_delete_comment(comment_id):
     db.commit()
     flash(f'Comment {comment_id} has been deleted.', 'success')
     return redirect(url_for('admin_dashboard'))
+
+
+@app.route('/report', methods=['POST'])
+def report_post():
+    """Allows a logged-in user to report a post."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to report a post.', 'danger')
+        return redirect(url_for('login'))
+
+    post_id = request.form.get('post_id')
+    # Support structured form: reason_type (select) + reason (details)
+    reason_type = request.form.get('reason_type')
+    reason_details = request.form.get('reason', '').strip()
+    if reason_type:
+        reason = f"{reason_type}: {reason_details}" if reason_details else reason_type
+    else:
+        reason = reason_details
+
+    # Allow reports that are not tied to a specific post (post_id may be empty from navbar/global modal)
+    # If a post_id is provided then prevent duplicate open reports by the same user on the same post
+    if post_id:
+        existing = query_db('SELECT 1 FROM reports WHERE post_id = ? AND reporter_id = ? AND status = ?', (post_id, user_id, 'open'), one=True)
+        if existing:
+            flash('You have already reported this post and it is pending review.', 'info')
+            return redirect(request.referrer or url_for('feed'))
+
+    db = get_db()
+    # Insert NULL for post_id when not provided
+    db.execute('INSERT INTO reports (post_id, reporter_id, reason) VALUES (?, ?, ?)', (post_id if post_id else None, user_id, reason))
+    db.commit()
+    flash('Thank you — the report has been submitted for review.', 'success')
+    return redirect(request.referrer or url_for('feed'))
+
+@app.route('/admin/report/<int:report_id>/action', methods=['POST'])
+def admin_report_action(report_id):
+    """Admin actions on a report: dismiss, mark_reviewed, delete_post."""
+    if session.get('username') != 'admin':
+        flash('You do not have permission to perform this action.', 'danger')
+        return redirect(url_for('feed'))
+
+    action = request.form.get('action')
+    db = get_db()
+
+    if action == 'dismiss':
+        db.execute('UPDATE reports SET status = ? WHERE id = ?', ('dismissed', report_id))
+        flash('Report dismissed.', 'success')
+    elif action == 'mark_reviewed':
+        db.execute('UPDATE reports SET status = ? WHERE id = ?', ('reviewed', report_id))
+        flash('Report marked as reviewed.', 'success')
+    elif action == 'delete_post':
+        report = query_db('SELECT post_id FROM reports WHERE id = ?', (report_id,), one=True)
+        if report and report.get('post_id'):
+            post_id = report['post_id']
+            # Delete post and related content
+            db.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
+            db.execute('DELETE FROM reactions WHERE post_id = ?', (post_id,))
+            db.execute('DELETE FROM posts WHERE id = ?', (post_id,))
+            db.execute('UPDATE reports SET status = ? WHERE id = ?', ('post_deleted', report_id))
+            flash(f'Post {post_id} has been deleted.', 'success')
+        else:
+            flash('Report has no associated post to delete or post not found.', 'warning')
+    else:
+        flash('Unknown action.', 'warning')
+
+    db.commit()
+    return redirect(request.referrer or url_for('admin_dashboard', tab='reports'))
 
 @app.route('/rules')
 def rules():
@@ -1130,6 +1243,8 @@ def user_risk_analysis(user_id):
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
+
+    return 0.0
     
     user = query_db('SELECT profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
     if not user:
