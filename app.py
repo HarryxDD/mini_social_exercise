@@ -1247,8 +1247,6 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
-    return 0.0
-    
     user = query_db('SELECT profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
     if not user:
         return 0.0
